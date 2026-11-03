@@ -188,8 +188,9 @@ def _dispatch(args: argparse.Namespace, cfg: Config, log: Log, vlog: Log) -> int
         st = _open(cfg, write=True)
         eng = Engine(cfg, st, log, lambda m: log(f"warning: {m}"))
         if not cfg.disks:
-            raise EngineError(f"no disks configured in {cfg.path}")
-        log(f"provenance {__version__}: recipe at {cfg.db_path}, watching {cfg.disks}")
+            log(f"no disks configured in {cfg.path}; idle until the config names one")
+        else:
+            log(f"provenance {__version__}: recipe at {cfg.db_path}, watching {cfg.disks}")
         Daemon(eng).run()
         return 0
     if c == "identify":
@@ -227,14 +228,19 @@ def _status(cfg: Config, args: argparse.Namespace) -> int:
             by[u.risk][0] += 1
             by[u.risk][1] += u.bytes
         risky = [u for u in units if u.risk == AT_RISK]
-        at_risk_any |= bool(risky)
+        # "Recreatable" from a source that has since vanished is not recreatable.
+        gone = [u for u in units if u.risk == RECREATABLE and _source_gone(u)]
+        at_risk_any |= bool(risky or gone)
         out.append({
             "uuid": d["uuid"], "root": d["root"], "label": d["label"], "size": d["size"],
             "mounted": bool(mounted and mounted.uuid == d["uuid"]),
             "last_full_scan": d["last_full_scan"],
             "risk": {r: {"units": n, "bytes": b} for r, (n, b) in by.items()},
             "at_risk": [{"path": u.path, "kind": u.kind, "bytes": u.bytes, "note": u.note,
-                         "told": u.notified_to} for u in risky],
+                         "told": u.notified_to} for u in risky]
+                       + [{"path": u.path, "kind": u.kind, "bytes": u.bytes,
+                           "note": "SOURCE GONE: " + str(_source_gone(u))
+                           + f" ({json.dumps(u.source)})", "told": None} for u in gone],
         })
     size = st.size()
     if args.json:
@@ -265,6 +271,14 @@ def _status(cfg: Config, args: argparse.Namespace) -> int:
         at = time.strftime("%H:%M:%S", time.localtime(entry["at"]))
         print(f"log {at} {entry['level']}: {entry['msg']}")
     return 1 if args.strict and at_risk_any else 0
+
+
+def _source_gone(u: UnitRow) -> str | None:
+    """Why the recorded source failed its last online check, or None if it did not."""
+    chk = u.detail.get("source_check")
+    if isinstance(chk, dict) and chk.get("ok") is False:
+        return str(chk.get("why") or "unreachable")
+    return None
 
 
 def _rel(cfg: Config, st: Store, path: str) -> tuple[str, str]:

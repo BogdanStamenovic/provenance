@@ -1,0 +1,10 @@
+[Unit]
+Description=provenance: check that recorded sources still exist online
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/provenance/current/.venv/bin/provenance -q check-sources
+# Exit 1 means "some source is gone": that is a finding, recorded in the recipe, not a failure.
+SuccessExitStatus=1

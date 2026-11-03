@@ -1,0 +1,16 @@
+[Unit]
+Description=provenance: keep a recipe for recreating the untrusted disks
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+# Root: fanotify filesystem marks need CAP_SYS_ADMIN, resolving file handles needs
+# CAP_DAC_READ_SEARCH, and attribution reads other users' /proc/PID/environ.
+ExecStart=/opt/provenance/current/.venv/bin/provenance watch
+Restart=on-failure
+RestartSec=30
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

@@ -7,6 +7,7 @@ import os
 import pwd
 import re
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -399,10 +400,19 @@ class Daemon:
 
         watchers: dict[str, tuple[Disk, Any]] = {}
         last_check = 0.0
+        cfg_mtime = _mtime(self.cfg.path)
         while True:
             now = time.time()
             if now - last_check > 60 or once:
                 last_check = now
+                if not once and _mtime(self.cfg.path) != cfg_mtime:
+                    # Simplest correct reload: start over with the new config. State is all
+                    # in the db, so nothing is lost; pending writes are flushed first.
+                    self.e.log(f"{self.cfg.path} changed; restarting")
+                    for d, w in watchers.values():
+                        self._flush(d)
+                        w.close()
+                    os.execv(sys.executable, [sys.executable, "-m", "provenance", *sys.argv[1:]])
                 self._sync_disks(watchers, Watcher)
                 for d, _w in watchers.values():
                     for disk, rel in self.e.ingest_spool():
@@ -548,6 +558,13 @@ class Daemon:
                 self.e.warn(str(exc))
         for d in disks.values():
             self.e.notify(d)
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
 
 
 def ensure_state(cfg: Config) -> None:

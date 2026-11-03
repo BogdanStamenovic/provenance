@@ -1,0 +1,20 @@
+# provenance config. The daemon reloads itself when this file changes.
+
+# Where the recipe lives. Must be a trusted disk (the SSD), never a watched one.
+state_dir = "/var/lib/provenance"
+
+# Mount points of the untrusted disks. Each must be its own filesystem (ext4/xfs/btrfs;
+# not NTFS/FUSE), mounted exactly here. While unmounted it is simply not watched.
+disks = []
+
+# Hard cap on the recipe. Over it, file listings are dropped, least valuable first.
+budget_mb = 50
+
+# HF hub caches to learn blob hashes from (learned hashes are kept after a cache is wiped).
+hf_hubs = ["/home/bodas/.cache/huggingface/hub", "/mnt/offload/hf/hub"]
+
+# Who to tell about at-risk data. The agent that wrote it is asked over hotline; when the
+# writer was not an agent, notify_fallback is told instead (empty: nobody, status only).
+notify_user = "bodas"
+notify_fallback = ""
+notify_cmd = "/home/bodas/.claude/bin/hotline"

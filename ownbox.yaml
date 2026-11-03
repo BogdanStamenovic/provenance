@@ -1,0 +1,24 @@
+schema: 1
+name: provenance
+description: Keep a recipe on the SSD for recreating everything on an untrusted disk.
+homepage: https://github.com/BogdanStamenovic/provenance
+tags: [backup, provenance, fanotify, huggingface, systemd, linux]
+
+# A root systemd service. Setup and update are the same idempotent script: it builds a
+# root-owned release under /opt/provenance/releases/<rev>, switches /opt/provenance/current
+# to it, and restarts the daemon. /etc/provenance.toml and the recipe in
+# /var/lib/provenance are never touched by setup or update; schema migrations are
+# additive, so `ownbox rollback` (which reruns the older revision's update) keeps the data.
+install:
+  platforms: [linux]
+  setup:
+    linux:
+      - sudo bash deploy/install.sh
+  update:
+    linux:
+      - sudo bash deploy/install.sh
+  remove:
+    linux:
+      - sudo bash deploy/uninstall.sh
+command:
+  linux: /opt/provenance/current/.venv/bin/provenance
