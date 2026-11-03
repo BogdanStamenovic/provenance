@@ -180,7 +180,11 @@ class Engine:
     def identify_online(self, disk: Disk, timeout: float = 20.0, max_repos: int = 200,
                         recheck_days: float = 7.0) -> list[str]:
         """Pull sha256 lists of candidate repos from the HF API; return units now matched."""
-        unknown = [u for u in self.store.units(disk.uuid, risk=AT_RISK) if u.kind == "weights"]
+        # Loose weights, and --local-dir HF downloads whose repo id was never recorded:
+        # their metadata still carries each file's sha256, which is enough to match.
+        unknown = [u for u in self.store.units(disk.uuid, risk=AT_RISK)
+                   if u.kind == "weights" or (u.kind == "hf-local" and u.source
+                                              and not u.source.get("ref"))]
         if not unknown:
             return []
         want = {}

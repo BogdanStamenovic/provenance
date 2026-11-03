@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "provenance"
-version = "0.1.0"
+version = "0.1.1"
 description = "Keep a recipe on the SSD for recreating everything on an untrusted disk."
 readme = "README.md"
 # tomllib (3.11) reads the config; nothing else outside the stdlib.

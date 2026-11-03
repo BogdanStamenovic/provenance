@@ -98,7 +98,7 @@ def test_config_refuses_recipe_on_watched_disk(tmp_path: Path) -> None:
 
 def _engine(tmp_path: Path, **kw: object) -> tuple[Engine, Store, Disk]:
     cfg = Config(state_dir=str(tmp_path / "state"), disks=[str(tmp_path / "disk")],
-                 notify_after_s=0, **kw)  # type: ignore[arg-type]
+                 notify_after_s=0, hf_hubs=[], **kw)  # type: ignore[arg-type]
     st = Store(cfg.db_path)
     return Engine(cfg, st), st, Disk("u1", str(tmp_path / "disk"), "", 0)
 
@@ -167,3 +167,25 @@ def test_claim_via_spool_is_attributed_to_file_owner(tmp_path: Path) -> None:
     c = st.claims("u1")["x"]
     assert c["kind"] == "expendable" and c["by"].endswith("(agent-3)")
     assert not list(eng.cfg.spool.glob("*.json"))
+
+
+def test_identify_online_covers_unattributed_hf_local_dirs(tmp_path: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    eng, st, d = _engine(tmp_path)
+    rev, sha = "c" * 40, "d" * 64
+    m = tmp_path / "disk" / "models" / "m"
+    meta = m / ".cache" / "huggingface" / "download"
+    meta.mkdir(parents=True)
+    (m / "w.safetensors").write_bytes(b"w")
+    (meta / "w.safetensors.metadata").write_text(f"{rev}\n{sha}\n1.0\n")
+    eng.scan(d)
+    assert st.units("u1")[0].risk == AT_RISK
+    st.index_hf([("e" * 64, "org/seen", rev, "x")])  # makes org/seen a candidate repo
+    import provenance.engine as pe
+    monkeypatch.setattr(pe, "hf_tree_entries",
+                        lambda repo, rev_, t: iter([(sha, repo, rev_, "w.safetensors")]
+                                                   if repo == "org/seen" else []))
+    assert eng.identify_online(d) == ["models/m"]
+    eng.scan(d, "models/m")
+    u = st.units("u1")[0]
+    assert u.risk == RECREATABLE and u.source and u.source["ref"] == "org/seen"
