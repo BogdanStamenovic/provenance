@@ -81,3 +81,18 @@ def test_show(cfg: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert main(["--config", cfg, "show", str(tmp_path / "disk" / "models" / "m" / "x")]) == 0
     out = capsys.readouterr().out
     assert "(models/m/x is inside this unit)" in out and "hf download o/m" in out
+
+
+def test_scan_works_with_areas_only(tmp_path: Path, capsys: pytest.CaptureFixture[str],
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    import provenance.prune as pr
+
+    area = tmp_path / "area"
+    (area / "__pycache__").mkdir(parents=True)
+    (area / "__pycache__" / "a.pyc").write_bytes(b"x")
+    c = tmp_path / "c.toml"
+    c.write_text(f'state_dir = "{tmp_path / "state"}"\nareas = ["{area}"]\nhf_hubs = []\n')
+    monkeypatch.setattr(pr, "mount_options", lambda p: ("/", "ext4", ["rw", "relatime"]))
+    monkeypatch.setattr("os.geteuid", lambda: 0)
+    assert main(["--config", str(c), "scan"]) == 0
+    assert "__pycache__" in capsys.readouterr().out

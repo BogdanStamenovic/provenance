@@ -405,8 +405,8 @@ def _show(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def _scan(cfg: Config, args: argparse.Namespace, log: Log, vlog: Log) -> int:
-    if not cfg.disks:
-        raise EngineError(f"no disks configured in {cfg.path}")
+    if not cfg.disks and not cfg.areas:
+        raise EngineError(f"no disks or areas configured in {cfg.path}")
     st = _open(cfg, write=not args.dry_run)
     eng = Engine(cfg, st, vlog, lambda m: log(f"warning: {m}"))
     targets: list[tuple[Disk, str]] = []
@@ -419,6 +419,14 @@ def _scan(cfg: Config, args: argparse.Namespace, log: Log, vlog: Log) -> int:
                 log(f"warning: {root} is not mounted; skipped")
                 continue
             targets.append((d, ""))
+        from .prune import probe_area
+
+        for a in cfg.areas:
+            ad = probe_area(a)
+            if ad is None:
+                log(f"warning: area {a} does not exist; skipped")
+                continue
+            targets.append((ad, ""))
     rc = 0
     for d, rel in targets:
         if args.dry_run:
