@@ -77,6 +77,33 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--source", help="hf:org/name[@rev], git:URL, https://URL, or free text")
     g.add_argument("--expendable", nargs="?", const="", metavar="REASON")
     g.add_argument("--clear", action="store_true")
+    g.add_argument("--keep", nargs="?", const="", metavar="REASON",
+                   help="never prune this (single-disk mode)")
+
+    s = sub.add_parser("prune", help="single-disk mode: what could be deleted (dry run)")
+    s.add_argument("area", nargs="?", help="only this area (default: all configured)")
+    s.add_argument("--days", type=float, help="unused for at least this long")
+    s.add_argument("--all", action="store_true", help="also list what is NOT prunable, and why")
+    s.add_argument("--offline", action="store_true", help="skip the online source checks")
+    s.add_argument("--json", action="store_true")
+    g2 = s.add_mutually_exclusive_group()
+    g2.add_argument("--propose", action="store_true",
+                    help="save the plan and send it to prune_approver for review (root)")
+    g2.add_argument("--approve", metavar="PLAN")
+    g2.add_argument("--reject", metavar="PLAN")
+    g2.add_argument("--apply", action="store_true",
+                    help="delete now, without a review step (root; asks first)")
+    s.add_argument("--yes", action="store_true", help="do not ask before --apply")
+
+    s = sub.add_parser("plans", help="prune plans and their status")
+    s.add_argument("--show", metavar="PLAN", help="print one plan in full")
+
+    s = sub.add_parser("pruned", help="what single-disk mode deleted, and how to get it back")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("restore", help="bring back one pruned unit (from trash or the recipe)")
+    s.add_argument("path")
+    s.add_argument("--dry-run", action="store_true")
 
     s = sub.add_parser("rebuild", help="print (or --run) the script that recreates a disk")
     s.add_argument("path", nargs="?", default="", help="only this subtree")
@@ -182,6 +209,14 @@ def _dispatch(args: argparse.Namespace, cfg: Config, log: Log, vlog: Log) -> int
                 for line in eng.notify(d, dry_run=args.dry_run):
                     print(line)
         return 0
+    if c == "prune":
+        return _prune(cfg, args, log)
+    if c == "plans":
+        return _plans(cfg, args)
+    if c == "pruned":
+        return _pruned(cfg, args)
+    if c == "restore":
+        return _restore(cfg, args, log)
     if c == "export":
         return _export(cfg, args, log)
     if c == "watch":
@@ -248,6 +283,12 @@ def _status(cfg: Config, args: argparse.Namespace) -> int:
                          indent=2))
         return 1 if args.strict and at_risk_any else 0
     print(f"recipe: {cfg.db_path}  {human(size)} of {cfg.budget_mb:g} MB budget")
+    pr_rows = st.pruned()
+    if cfg.areas or pr_rows:
+        print(f"single-disk mode: areas {', '.join(cfg.areas) or 'none'}; "
+              f"auto_prune {'on' if cfg.auto_prune else 'off'}; {len(pr_rows)} unit(s) pruned "
+              f"({human(sum(r['bytes'] for r in pr_rows))}); "
+              f"{len(st.plans('pending'))} plan(s) awaiting review")
     if not out:
         print("no disks scanned yet")
     for info in out:
@@ -392,8 +433,14 @@ def _scan(cfg: Config, args: argparse.Namespace, log: Log, vlog: Log) -> int:
 
 
 def _claim(cfg: Config, args: argparse.Namespace, log: Log) -> int:
-    kind = "clear" if args.clear else ("expendable" if args.expendable is not None else "source")
-    value = args.source if kind == "source" else (args.expendable or "")
+    if args.clear:
+        kind, value = "clear", ""
+    elif args.keep is not None:
+        kind, value = "keep", args.keep
+    elif args.expendable is not None:
+        kind, value = "expendable", args.expendable
+    else:
+        kind, value = "source", args.source
     path = os.path.realpath(args.path)
     agent = attribution.agent_name(os.environ.get("CLAUDE_CODE_SESSION_ID"))
     if os.geteuid() == 0:
@@ -615,4 +662,151 @@ def _export(cfg: Config, args: argparse.Namespace, log: Log) -> int:
     with open(args.output, "wb") as f:
         f.write(lzma.compress(raw, preset=9 | lzma.PRESET_EXTREME))
     log(f"wrote {args.output} ({human(os.path.getsize(args.output))})")
+    return 0
+
+
+# --- single-disk mode ------------------------------------------------------------------
+
+
+def _age(t: float | None) -> str:
+    return f"{(time.time() - t) / 86400:.0f} d" if t else "never seen"
+
+
+def _spool_request(cfg: Config, kind: str, value: str, log: Log) -> int:
+    if not cfg.spool.is_dir():
+        raise EngineError(f"{cfg.spool} does not exist (is provenance installed?)")
+    agent = attribution.agent_name(os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    name = cfg.spool / f"{time.time():.3f}-{os.getpid()}-{secrets.token_hex(4)}.json"
+    tmp = name.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"path": "", "kind": kind, "value": value, "agent": agent}))
+    tmp.rename(name)
+    log(f"queued; the daemon applies it within a minute ({name.name})")
+    return 0
+
+
+def _prune(cfg: Config, args: argparse.Namespace, log: Log) -> int:
+    from .prune import PruneError, Pruner, probe_area
+
+    if args.approve or args.reject:
+        pid = args.approve or args.reject
+        if os.geteuid() != 0:
+            return _spool_request(cfg, "plan-approve" if args.approve else "plan-reject",
+                                  pid, log)
+        st = _open(cfg, write=True)
+        by = os.environ.get("SUDO_USER") or "root"
+        Engine(cfg, st, log, log).decide_plan(pid, bool(args.approve), by)
+        log(f"plan {pid} {'approved: the daemon applies it within a minute' if args.approve else 'rejected'}")
+        return 0
+    write = bool(args.propose or args.apply)
+    st = _open(cfg, write=write)
+    eng = Engine(cfg, st, log, lambda m: log(f"warning: {m}"))
+    pr = Pruner(eng, log)
+    areas = [probe_area(args.area)] if args.area else list(pr.areas())
+    if not cfg.areas:
+        raise EngineError(f"no areas configured in {cfg.path} (single-disk mode is off)")
+    rc = 0
+    for area in areas:
+        if area is None:
+            raise EngineError(f"{args.area} does not exist")
+        if write:
+            eng.scan(area)
+        if args.propose:
+            made = pr.propose(area)
+            if made is None:
+                log(f"{area.root}: nothing to propose (or a plan is already pending)")
+                continue
+            pid, _ = made
+            print(pr.summary(pid))
+            eng._send(cfg.prune_approver, pr.summary(pid))
+            continue
+        cands = pr.candidates(area, days=args.days, online=not args.offline)
+        ok = [c for c in cands if c.ok]
+        if args.json:
+            print(json.dumps([{"path": c.unit.path, "kind": c.unit.kind, "bytes": c.bytes,
+                               "last_used": c.last_used, "used_by": c.used_by,
+                               "prunable": c.ok, "why_not": c.reasons, "verified": c.verified}
+                              for c in cands], indent=2))
+        else:
+            print(f"{area.root}  ({area.label})")
+            for c in sorted(ok, key=lambda c: -c.bytes):
+                print(f"  PRUNE {human(c.bytes):>9}  {c.unit.path} [{c.unit.kind}] unused "
+                      f"{_age(c.last_used)} ({c.used_by}); {c.verified}")
+            if args.all:
+                for c in sorted([c for c in cands if not c.ok], key=lambda c: -c.bytes):
+                    print(f"  keep  {human(c.bytes):>9}  {c.unit.path} [{c.unit.kind}] "
+                          f"{'; '.join(c.reasons)}")
+            print(f"  -> {len(ok)} unit(s), {human(sum(c.bytes for c in ok))} prunable"
+                  + ("" if args.apply else " (dry run)"))
+        if args.apply and ok:
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    log("provenance: error: refusing to --apply without --yes (no TTY)")
+                    return 2
+                log("Delete these now? Type 'yes': ")
+                try:
+                    reply = input()
+                except EOFError:
+                    reply = ""
+                if reply.strip().lower() != "yes":
+                    log("Aborted.")
+                    return 2
+            try:
+                res = pr.apply(area, [c.unit.path for c in ok], None)
+            except (PruneError, OSError) as exc:
+                log(f"provenance: error: {exc}")
+                rc = 1
+                continue
+            log(f"pruned {len(res['done'])} unit(s), {human(res['freed'])}; "
+                f"{len(res['skipped'])} skipped at delete time")
+            for sk in res["skipped"]:
+                log(f"  skipped {sk['path']}: {sk['why']}")
+    return rc
+
+
+def _plans(cfg: Config, args: argparse.Namespace) -> int:
+    from .prune import Pruner
+
+    st = _open(cfg, write=False)
+    if args.show:
+        print(Pruner(Engine(cfg, st)).summary(args.show))
+        return 0
+    for p in st.plans():
+        items = json.loads(p["items"])
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(p["created"]))
+        tot = sum(int(i["bytes"]) for i in items)
+        by = f" by {p['decided_by']}" if p["decided_by"] else ""
+        print(f"{p['id']}  {when}  {p['status']:<9}{by}  {len(items)} unit(s) "
+              f"{human(tot)}  {p['disk'].removeprefix('area:')}")
+    return 0
+
+
+def _pruned(cfg: Config, args: argparse.Namespace) -> int:
+    st = _open(cfg, write=False)
+    rows = st.pruned()
+    if args.json:
+        print(json.dumps([{"path": os.path.join(r["disk"].removeprefix("area:"), r["path"]),
+                           "kind": r["kind"], "bytes": r["bytes"], "pruned_at": r["pruned_at"],
+                           "plan": r["plan"], "in_trash": bool(r["trash"] and not r["purged_at"]),
+                           "rebuild": json.loads(r["unit"])["rebuild"]} for r in rows], indent=2))
+        return 0
+    for r in rows:
+        where = ("in trash until purge" if r["trash"] and not r["purged_at"]
+                 else "rebuild from recipe")
+        print(f"{human(r['bytes']):>9}  {os.path.join(r['disk'].removeprefix('area:'), r['path'])}"
+              f"  [{r['kind']}] {time.strftime('%Y-%m-%d', time.localtime(r['pruned_at']))}"
+              f"  {where}")
+    print(f"{len(rows)} pruned unit(s), {human(sum(r['bytes'] for r in rows))}")
+    return 0
+
+
+def _restore(cfg: Config, args: argparse.Namespace, log: Log) -> int:
+    from .prune import PruneError, Pruner
+
+    st = _open(cfg, write=not args.dry_run)
+    try:
+        msg = Pruner(Engine(cfg, st, log, log), log).restore(args.path, dry_run=args.dry_run)
+    except PruneError as exc:
+        log(f"provenance: error: {exc}")
+        return 1
+    print(msg)
     return 0

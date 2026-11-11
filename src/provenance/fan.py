@@ -182,3 +182,71 @@ class Watcher:
                 break
             out.extend(self._parse(data))
         return out
+
+
+FAN_OPEN = 0x00000020
+FAN_OPEN_EXEC = 0x00001000
+FAN_MARK_MOUNT = 0x00000010
+_META_FD = _META  # same fanotify_event_metadata layout; here fd is a real open fd
+
+
+class OpenWatcher:
+    """Every open (and exec) on one mount, as (path, pid). For "is this still used?".
+
+    Mount marks with fd reporting need no file handles, so this works where `Watcher`
+    cannot (ntfs3, FUSE), and on noatime mounts where atime says nothing. It sees opens
+    only while it runs; callers track coverage themselves.
+    """
+
+    def __init__(self, mountpoint: str) -> None:
+        self.mountpoint = mountpoint
+        fd = _libc.fanotify_init(FAN_CLOEXEC | FAN_NONBLOCK | FAN_CLASS_NOTIF
+                                 | FAN_UNLIMITED_QUEUE, os.O_RDONLY | os.O_LARGEFILE)
+        if fd < 0:
+            e = ctypes.get_errno()
+            raise FanotifyError(e, f"fanotify_init: {os.strerror(e)} (needs root)")
+        self.fd = fd
+        rc = _libc.fanotify_mark(fd, FAN_MARK_ADD | FAN_MARK_MOUNT, FAN_OPEN | FAN_OPEN_EXEC,
+                                 AT_FDCWD, mountpoint.encode())
+        if rc < 0:
+            e = ctypes.get_errno()
+            os.close(fd)
+            raise FanotifyError(e, f"fanotify_mark (mount) {mountpoint}: {os.strerror(e)}")
+        self.overflowed = False
+
+    def close(self) -> None:
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+    def read(self, timeout: float | None = None) -> list[tuple[str, int]]:
+        r, _, _ = select.select([self.fd], [], [], timeout)
+        if not r:
+            return []
+        out: list[tuple[str, int]] = []
+        while True:
+            try:
+                data = os.read(self.fd, 1 << 16)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    break
+                raise
+            if not data:
+                break
+            off = 0
+            while off + _META_FD.size <= len(data):
+                event_len, _v, _r, _ml, mask, efd, pid = _META_FD.unpack_from(data, off)
+                if event_len < _META_FD.size:
+                    break
+                if mask & FAN_Q_OVERFLOW:
+                    self.overflowed = True
+                if efd >= 0:
+                    try:
+                        out.append((os.readlink(f"/proc/self/fd/{efd}"), pid))
+                    except OSError:
+                        pass
+                    finally:
+                        os.close(efd)
+                off += event_len
+        return out

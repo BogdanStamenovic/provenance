@@ -18,3 +18,16 @@ hf_hubs = ["/home/bodas/.cache/huggingface/hub", "/mnt/offload/hf/hub"]
 notify_user = "bodas"
 notify_fallback = ""
 notify_cmd = "/home/bodas/.claude/bin/hotline"
+
+# --- single-disk mode: delete unused, recreatable things after saving their recipe ------
+# Directories (not necessarily mount points) whose units may be pruned. Empty: off.
+areas = []
+prune_after_days = 30
+# Soft delete: pruned units wait in <area>/.provenance-trash this long (HF caches excepted).
+trash_grace_h = 24
+# When true, the daemon proposes one plan per area per day to prune_approver and deletes
+# nothing until that plan is approved (provenance prune --approve ID).
+auto_prune = false
+prune_approver = "hotline-80"
+prune_report_to = ""
+plan_ttl_h = 48

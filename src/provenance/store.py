@@ -13,7 +13,7 @@ import lzma
 import os
 import sqlite3
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS filehash (
 );
 CREATE TABLE IF NOT EXISTS log (at REAL, level TEXT, msg TEXT);
 CREATE TABLE IF NOT EXISTS hfrepo_checked (repo TEXT PRIMARY KEY, at REAL, ok INTEGER);
+CREATE TABLE IF NOT EXISTS usage (disk TEXT, path TEXT, last_open REAL, PRIMARY KEY (disk, path));
+CREATE TABLE IF NOT EXISTS watch_cov (disk TEXT PRIMARY KEY, since REAL, heartbeat REAL);
+CREATE TABLE IF NOT EXISTS pruned (
+  disk TEXT, path TEXT, kind TEXT, bytes INTEGER, unit TEXT, listing BLOB, owner INTEGER,
+  plan TEXT, pruned_at REAL, trash TEXT, purged_at REAL, restored_at REAL,
+  PRIMARY KEY (disk, path, pruned_at)
+);
+CREATE TABLE IF NOT EXISTS prune_plans (
+  id TEXT PRIMARY KEY, disk TEXT, created REAL, items TEXT, status TEXT,
+  decided_by TEXT, decided_at REAL, result TEXT
+);
 """
 
 OPTIONAL_UNIT_COLS = ("at_risk_since",)
@@ -406,6 +417,107 @@ class Store:
         self.db.execute("VACUUM")
         return dropped
 
+    # --- single-disk mode: usage, coverage, plans, pruned units ------------------------
+
+    def record_usage(self, disk: str, seen: dict[str, float]) -> None:
+        with self.db:
+            for path, at in seen.items():
+                self.db.execute(
+                    "INSERT INTO usage (disk, path, last_open) VALUES (?,?,?) "
+                    "ON CONFLICT(disk, path) DO UPDATE SET "
+                    "last_open=max(last_open, excluded.last_open)", (disk, path, at))
+
+    def last_open(self, disk: str, path: str) -> float | None:
+        r = self.db.execute(
+            "SELECT max(last_open) FROM usage WHERE disk=? AND "
+            "(path=? OR path LIKE ? ESCAPE '\\' OR ? LIKE path || '/%')",
+            (disk, path, _like_prefix(path), path)).fetchone()
+        return float(r[0]) if r and r[0] is not None else None
+
+    def coverage(self, disk: str) -> tuple[float, float] | None:
+        r = self.db.execute("SELECT since, heartbeat FROM watch_cov WHERE disk=?",
+                            (disk,)).fetchone()
+        return (float(r[0]), float(r[1])) if r else None
+
+    def set_coverage(self, disk: str, since: float, heartbeat: float) -> None:
+        self.db.execute("INSERT OR REPLACE INTO watch_cov (disk, since, heartbeat) "
+                        "VALUES (?,?,?)", (disk, since, heartbeat))
+        self.db.commit()
+
+    def save_plan(self, pid: str, disk: str, items: list[dict[str, object]]) -> None:
+        self.db.execute("INSERT INTO prune_plans (id, disk, created, items, status) "
+                        "VALUES (?,?,?,?,'pending')", (pid, disk, time.time(), json.dumps(items)))
+        self.db.commit()
+
+    def _rows(self, q: str, args: Sequence[object] = ()) -> list[sqlite3.Row]:
+        """Rows from a table a newer version added; [] on a recipe not yet migrated."""
+        try:
+            return list(self.db.execute(q, args))
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return []
+            raise
+
+    def plans(self, status: str | None = None) -> list[sqlite3.Row]:
+        q = "SELECT * FROM prune_plans"
+        args: tuple[object, ...] = ()
+        if status:
+            q += " WHERE status=?"
+            args = (status,)
+        return self._rows(q + " ORDER BY created DESC", args)
+
+    def plan(self, pid: str) -> sqlite3.Row | None:
+        r: sqlite3.Row | None = self.db.execute(
+            "SELECT * FROM prune_plans WHERE id=?", (pid,)).fetchone()
+        return r
+
+    def decide_plan(self, pid: str, status: str, by: str, result: object = None) -> None:
+        self.db.execute("UPDATE prune_plans SET status=?, decided_by=coalesce(?, decided_by), "
+                        "decided_at=coalesce(decided_at, ?), result=coalesce(?, result) "
+                        "WHERE id=?",
+                        (status, by or None, time.time(),
+                         json.dumps(result) if result is not None else None, pid))
+        self.db.commit()
+
+    def recently_rejected(self, disk: str, days: float = 30) -> set[str]:
+        out: set[str] = set()
+        for r in self.db.execute("SELECT items FROM prune_plans WHERE disk=? AND "
+                                 "status='rejected' AND decided_at > ?",
+                                 (disk, time.time() - days * 86400)):
+            out |= {str(i["path"]) for i in json.loads(r["items"])}
+        return out
+
+    def add_pruned(self, disk: str, u: UnitRow, owner: int, plan: str | None,
+                   trash: str | None, freed: int | None = None) -> None:
+        row = self.db.execute("SELECT listing FROM units WHERE disk=? AND path=?",
+                              (disk, u.path)).fetchone()
+        unit = {"path": u.path, "kind": u.kind, "risk": u.risk, "files": u.files,
+                "bytes": u.bytes, "source": u.source, "rebuild": u.rebuild,
+                "detail": u.detail, "note": u.note}
+        with self.db:
+            self.db.execute(
+                "INSERT INTO pruned (disk, path, kind, bytes, unit, listing, owner, plan, "
+                "pruned_at, trash) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (disk, u.path, u.kind, u.bytes if freed is None else freed, json.dumps(unit),
+                 row["listing"] if row else None, owner, plan, time.time(), trash))
+            self.db.execute("DELETE FROM units WHERE disk=? AND path=?", (disk, u.path))
+
+    def pruned(self, disk: str | None = None, live_only: bool = True) -> list[sqlite3.Row]:
+        q = "SELECT * FROM pruned WHERE 1=1"
+        args: list[object] = []
+        if disk:
+            q += " AND disk=?"
+            args.append(disk)
+        if live_only:
+            q += " AND restored_at IS NULL"
+        return self._rows(q + " ORDER BY pruned_at DESC", args)
+
+    def mark_pruned(self, disk: str, path: str, pruned_at: float, col: str) -> None:
+        assert col in ("purged_at", "restored_at")
+        self.db.execute(f"UPDATE pruned SET {col}=? WHERE disk=? AND path=? AND pruned_at=?",
+                        (time.time(), disk, path, pruned_at))
+        self.db.commit()
+
     def vacuum(self) -> None:
         self.db.execute("VACUUM")
 
@@ -429,7 +541,11 @@ def _row(r: sqlite3.Row) -> UnitRow:
 
 def sha256_file(path: str, chunk: int = 8 << 20) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    try:  # O_NOATIME: hashing a file must not make it look used (see classify.last_used)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOATIME", 0))
+    except PermissionError:
+        fd = os.open(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as f:
         while True:
             b = f.read(chunk)
             if not b:

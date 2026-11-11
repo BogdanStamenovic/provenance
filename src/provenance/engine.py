@@ -229,7 +229,16 @@ class Engine:
                 if d is None:
                     raise EngineError(f"{r} is not mounted")
                 return d, os.path.relpath(ap, r) if ap != r else ""
-        raise EngineError(f"{abspath} is not on a watched disk ({', '.join(self.cfg.disks)})")
+        for a in self.cfg.areas:
+            if ap == a or ap.startswith(a.rstrip("/") + "/"):
+                from .prune import probe_area
+
+                ad = probe_area(a)
+                if ad is None:
+                    raise EngineError(f"area {a} does not exist")
+                return ad, os.path.relpath(ap, a) if ap != a else ""
+        where = ", ".join([*self.cfg.disks, *self.cfg.areas])
+        raise EngineError(f"{abspath} is not on a watched disk or area ({where})")
 
     def apply_claim(self, abspath: str, kind: str, value: str, by: str) -> tuple[Disk, str]:
         disk, rel = self.resolve(abspath)
@@ -251,6 +260,9 @@ class Engine:
                 req = json.loads(f.read_text())
                 user = pwd.getpwuid(st.st_uid).pw_name
                 by = user + (f" ({req['agent']})" if req.get("agent") else "")
+                if req["kind"] in ("plan-approve", "plan-reject"):
+                    self.decide_plan(req["value"], req["kind"] == "plan-approve", by)
+                    continue
                 done.append(self.apply_claim(req["path"], req["kind"], req.get("value", ""), by))
             except (OSError, ValueError, KeyError, EngineError) as exc:
                 self.warn(f"bad claim {f.name}: {exc}")
@@ -258,6 +270,18 @@ class Engine:
             finally:
                 f.unlink(missing_ok=True)
         return done
+
+    def decide_plan(self, pid: str, approve: bool, by: str) -> None:
+        p = self.store.plan(pid)
+        if p is None:
+            raise EngineError(f"no prune plan {pid}")
+        if p["status"] != "pending":
+            raise EngineError(f"plan {pid} is {p['status']}, not pending")
+        if time.time() - p["created"] > self.cfg.plan_ttl_h * 3600:
+            self.store.decide_plan(pid, "expired", "")
+            raise EngineError(f"plan {pid} expired")
+        self.store.decide_plan(pid, "approved" if approve else "rejected", by)
+        self.store.log("info", f"plan {pid} {'approved' if approve else 'rejected'} by {by}")
 
     # --- telling the writer ------------------------------------------------------------
 
@@ -291,6 +315,10 @@ class Engine:
 
     def notify(self, disk: Disk, dry_run: bool = False) -> list[str]:
         sent: list[str] = []
+        if disk.uuid.startswith("area:"):
+            # In a single-disk area, AT RISK only means "never pruned": nothing is lost, so
+            # nobody is asked. Asking writers is for disks that may die (cfg.disks).
+            return sent
         for agent, paths in self.pending_notices(disk).items():
             lines = []
             for p in paths[:20]:
@@ -372,6 +400,10 @@ class Daemon:
         self.writes: dict[str, dict[tuple[str, int], tuple[float, float, int]]] = {}
         self.dirty: dict[tuple[str, str, bool], float] = {}
         self.last_identify: dict[str, float] = {}
+        self.openers: dict[str, Any] = {}  # mountpoint -> OpenWatcher (noatime areas)
+        self.usage: dict[str, dict[str, float]] = {}  # area uuid -> unit path -> last open
+        self.area_units: dict[str, set[str]] = {}
+        self.last_prune_cycle: dict[str, float] = {}
 
     def _writer(self, pid: int) -> int | None:
         now = time.time()
@@ -418,16 +450,22 @@ class Daemon:
                         w.close()
                     os.execv(sys.executable, [sys.executable, "-m", "provenance", *sys.argv[1:]])
                 self._sync_disks(watchers, Watcher)
+                self._sync_areas(watchers, Watcher)
+                for disk, rel in self.e.ingest_spool():
+                    self.dirty[(disk.uuid, rel, False)] = 0
+                self._flush_usage(now)
                 for d, _w in watchers.values():
-                    for disk, rel in self.e.ingest_spool():
-                        if disk.uuid == d.uuid:
-                            self.dirty[(d.uuid, rel, False)] = 0
                     # Cheap (milliseconds): learn HF blobs before the cache gets wiped.
                     self.e.refresh_hf_index()
                     self._full_scan_if_due(d)
                     self._identify_if_due(d)
                     self._flush(d)
                     self.e.notify(d)
+                    if d.uuid.startswith("area:"):
+                        self.area_units[d.uuid] = {
+                            u.path for u in self.e.store.units(d.uuid) if u.path}
+                        self._prune_cycle(d)
+            self._read_opens()
             for disk, w in list(watchers.values()):
                 try:
                     events = w.read(timeout=1.0 / max(len(watchers), 1))
@@ -467,6 +505,145 @@ class Daemon:
             watchers[d.uuid] = (d, watcher_cls(d.root))
             self.e.log(f"watching {d.root} (uuid {d.uuid})")
             self.e.store.log("info", f"watching {d.root} (uuid {d.uuid})")
+
+    # --- single-disk mode --------------------------------------------------------------
+
+    def _sync_areas(self, watchers: dict[str, tuple[Disk, Any]], watcher_cls: type) -> None:
+        from .fan import FanotifyError, OpenWatcher
+        from .prune import mount_options, probe_area
+
+        now = time.time()
+        for a in self.cfg.areas:
+            d = probe_area(a)
+            if d is None or d.uuid in watchers:
+                continue
+            try:
+                w = watcher_cls(d.root)
+            except FanotifyError as exc:
+                self.e.warn(f"area {a}: no write attribution ({exc})")
+                w = _NullWatcher()
+            watchers[d.uuid] = (d, w)
+            mnt, _fs, opts = mount_options(d.root)
+            if "noatime" in opts and mnt not in self.openers:
+                try:
+                    self.openers[mnt] = OpenWatcher(mnt)
+                except FanotifyError as exc:
+                    self.e.warn(f"area {a}: cannot track opens on {mnt} ({exc}); "
+                                "nothing there will ever count as unused")
+            self._start_coverage(d, now)
+            self.e.log(f"area {d.root} ({d.label}); unused = "
+                       + ("observed opens" if "noatime" in opts else "atime"))
+
+    def _start_coverage(self, d: Disk, now: float) -> None:
+        """Keep the "watched since" clock across a restart or a power-off, not a long stop.
+
+        A gap is harmless when the daemon was merely restarted (< 1 h) or the machine
+        was off (it booted after the last heartbeat and we started soon after boot).
+        Any other gap means opens may have been missed, so the clock starts over.
+        """
+        cov = self.e.store.coverage(d.uuid)
+        since = now
+        if cov:
+            prev_since, beat = cov
+            boot = _boot_time()
+            if now - beat < 3600 or (boot > beat and now - boot < 900):
+                since = prev_since
+        self.e.store.set_coverage(d.uuid, since, now)
+
+    def _read_opens(self) -> None:
+        if not self.openers:
+            return
+        now = time.time()
+        areas = {d: os.path.realpath(d.removeprefix("area:")) for d in self.area_units} or {
+            f"area:{a}": a for a in self.cfg.areas}
+        for mnt, w in list(self.openers.items()):
+            try:
+                events = w.read(timeout=0)
+            except OSError as exc:
+                self.e.warn(f"open tracking on {mnt} failed: {exc}")
+                w.close()
+                del self.openers[mnt]
+                continue
+            for path, pid in events:
+                if pid == self.me or "/.git/" in path:
+                    continue
+                for uuid, root in areas.items():
+                    if path.startswith(root + "/"):
+                        rel = path[len(root) + 1:]
+                        self.usage.setdefault(uuid, {})[self._unit_of(uuid, rel)] = now
+                        break
+            if w.overflowed:
+                # Missed opens: anything might have been used. Restart the clock.
+                w.overflowed = False
+                for uuid in areas:
+                    self.e.store.set_coverage(uuid, now, now)
+                self.e.warn(f"open tracking on {mnt} overflowed; unused-clock restarted")
+
+    def _unit_of(self, uuid: str, rel: str) -> str:
+        units = self.area_units.get(uuid, set())
+        parts = rel.split("/")
+        for i in range(len(parts), 0, -1):
+            p = "/".join(parts[:i])
+            if p in units:
+                return p
+        return parts[0]
+
+    def _flush_usage(self, now: float) -> None:
+        for uuid, seen in self.usage.items():
+            if seen:
+                self.e.store.record_usage(uuid, seen)
+        self.usage = {}
+        for a in self.cfg.areas:
+            uuid = f"area:{a}"
+            cov = self.e.store.coverage(uuid)
+            if cov:
+                self.e.store.set_coverage(uuid, cov[0], now)
+
+    def _prune_cycle(self, d: Disk) -> None:
+        """Daily: purge expired trash, expire stale plans, propose one, apply approved."""
+        from .prune import PruneError, Pruner
+
+        pr = Pruner(self.e, self.e.log)
+        for p in self.e.store.plans("approved"):
+            if p["disk"] != d.uuid:
+                continue
+            paths = [i["path"] for i in json.loads(p["items"])]
+            try:
+                res = pr.apply(d, paths, p["id"])
+            except (PruneError, OSError) as exc:
+                self.e.store.decide_plan(p["id"], "failed", "", {"error": str(exc)})
+                self._report(f"[provenance] plan {p['id']} FAILED: {exc}")
+                continue
+            self._report(
+                f"[provenance] plan {p['id']} applied: {len(res['done'])} unit(s) pruned, "
+                f"{classify.human(res['freed'])} freed"
+                + (f"; {len(res['skipped'])} skipped at delete time: "
+                   + "; ".join(f"{s['path']}: {s['why']}" for s in res["skipped"][:5])
+                   if res["skipped"] else "")
+                + ". Undo one: provenance restore PATH")
+        if not self.cfg.auto_prune:
+            return
+        now = time.time()
+        if now - self.last_prune_cycle.get(d.uuid, 0) < 86400:
+            return
+        self.last_prune_cycle[d.uuid] = now
+        pr.purge_trash()
+        for p in self.e.store.plans("pending"):
+            if now - p["created"] > self.cfg.plan_ttl_h * 3600:
+                self.e.store.decide_plan(p["id"], "expired", "")
+        try:
+            made = pr.propose(d)
+        except (PruneError, OSError) as exc:
+            self.e.warn(f"prune plan for {d.root}: {exc}")
+            return
+        if made:
+            pid, _ = made
+            self.e._send(self.cfg.prune_approver, pr.summary(pid))
+            self.e.store.log("info", f"proposed plan {pid} to {self.cfg.prune_approver}")
+
+    def _report(self, msg: str) -> None:
+        for to in {self.cfg.prune_approver, self.cfg.prune_report_to} - {""}:
+            self.e._send(to, msg)
 
     def _identify_if_due(self, d: Disk) -> None:
         now = time.time()
@@ -562,6 +739,30 @@ class Daemon:
                 self.e.warn(str(exc))
         for d in disks.values():
             self.e.notify(d)
+
+
+class _NullWatcher:
+    """Stands in when a filesystem cannot take a write mark: no attribution, no events."""
+
+    overflowed = False
+
+    def read(self, timeout: float | None = None) -> list[Any]:
+        time.sleep(timeout or 0)
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+def _boot_time() -> float:
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except OSError:
+        pass
+    return 0.0
 
 
 def _mtime(path: str) -> float:

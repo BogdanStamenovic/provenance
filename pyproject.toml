@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "provenance"
-version = "0.1.1"
+version = "0.2.0"
 description = "Keep a recipe on the SSD for recreating everything on an untrusted disk."
 readme = "README.md"
 # tomllib (3.11) reads the config; nothing else outside the stdlib.
@@ -22,8 +22,14 @@ classifiers = [
 ]
 dependencies = []
 
+# Single-disk mode deletes HF caches through huggingface_hub's own cache API: since 2.4 the
+# cache has a refcounted shared blob store that must not be edited by hand. The daemon's
+# venv installs this extra; everything else in provenance stays stdlib-only.
+
 [project.optional-dependencies]
+hf = ["huggingface_hub>=2.4,<3"]
 dev = [
+  "huggingface_hub>=2.4,<3",
   "pytest>=8.0,<10",
   "pytest-cov>=5.0,<7",
   "ruff>=0.6,<1",

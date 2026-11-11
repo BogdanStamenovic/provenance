@@ -20,8 +20,10 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,8 +41,9 @@ WEIGHT_MIN_AMBIGUOUS = 50 * 1024 * 1024
 AMBIGUOUS_EXT = {".bin", ".npz", ".msgpack"}
 ARCHIVE_RE = re.compile(r"\.(tar|tgz|tbz2|txz|tzst|zip|7z|rar|zst|xz|gz|bz2|lz4)$", re.IGNORECASE)
 IMAGE_EXT = {".iso", ".img", ".qcow2", ".vmdk", ".vdi", ".vhd", ".vhdx", ".raw"}
-CACHE_NAMES = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "uv-cache",
+CACHE_NAMES = {"__pycache__", ".locks", ".pytest_cache", ".mypy_cache", ".ruff_cache", "uv-cache",
                ".uv-cache", ".npm", ".cargo-cache", ".gradle", "pip-cache", ".tox", ".nox"}
+MARKER_FILES = {"CACHEDIR.TAG", ".DS_Store", "version.txt", "version_diffusers_cache.txt"}
 LOCKFILES = ("package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -81,8 +84,97 @@ class Context:
     warn: Callable[[str], None] = lambda msg: None
 
 
+def read_noatime(path: str | Path) -> bytes:
+    """Read a file without updating its atime, so our own scans never look like use.
+
+    O_NOATIME is allowed for the file's owner and for root (CAP_FOWNER); anyone else
+    gets EPERM, and then we read normally (and that one read does count as use).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOATIME", 0))
+    except PermissionError:
+        fd = os.open(path, os.O_RDONLY)
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def _read_text(path: str | Path) -> str:
+    return read_noatime(path).decode(errors="replace")
+
+
+def last_used(abs_: str, dev: int, follow: bool = False) -> float:
+    """Newest atime/mtime of the regular files under abs_ (or of abs_ itself).
+
+    Only meaningful on a filesystem that records atime (relatime/strictatime); on noatime
+    it is just the newest mtime, and the daemon's open-tracking has to stand in.
+    .git/ internals are skipped: our own `git status` reads them on every scan.
+    `follow` follows symlinks to regular files (HF snapshots link to the real blobs).
+    """
+    newest = 0.0
+    try:
+        st = os.stat(abs_, follow_symlinks=follow)
+    except OSError:
+        return 0.0
+    if not os.path.isdir(abs_):
+        return max(st.st_atime, st.st_mtime)
+    stack = [abs_]
+    while stack:
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                if e.name == ".git":
+                    continue
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if e.stat(follow_symlinks=False).st_dev == dev:
+                            stack.append(e.path)
+                        continue
+                    if follow or e.is_file(follow_symlinks=False):
+                        fst = e.stat(follow_symlinks=follow)
+                        newest = max(newest, fst.st_atime, fst.st_mtime)
+                except OSError:
+                    continue
+    return newest
+
+
 def _q(rel: str) -> str:
     return '"$ROOT/' + rel.replace('"', '\\"') + '"' if rel else '"$ROOT"'
+
+
+@contextmanager
+def preserve_atimes(root: str) -> Iterator[None]:
+    """Undo the atime bumps our own commands cause in a worktree (not .git/).
+
+    `git status` re-reads files whose index entry is stale, and that read counts as use
+    on a relatime mount: checking whether a repo is unused would make it used. Only
+    files whose mtime did not change are put back, so a real edit is never masked.
+    """
+    before: dict[str, tuple[int, int]] = {}
+    for dp, dn, fn in os.walk(root):
+        if ".git" in dn:
+            dn.remove(".git")
+        for f in fn:
+            p = os.path.join(dp, f)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                before[p] = (st.st_atime_ns, st.st_mtime_ns)
+    try:
+        yield
+    finally:
+        for p, (a, m) in before.items():
+            try:
+                st = os.lstat(p)
+                if st.st_atime_ns != a and st.st_mtime_ns == m:
+                    os.utime(p, ns=(a, m), follow_symlinks=False)
+            except OSError:
+                continue
 
 
 def _git(repo: str, *args: str) -> str | None:
@@ -264,7 +356,13 @@ def _hf_cache_repo(abs_: str, rel: str, dev: int) -> Unit | None:
         for dp, _dn, fn in os.walk(sd):
             for f in fn:
                 p = os.path.join(dp, f)
-                tgt = os.path.basename(os.path.realpath(p))
+                # First hop only: snapshots/<rev>/f -> ../../blobs/<etag>, and an LFS etag is
+                # the file's sha256. realpath would go on into huggingface_hub's shared
+                # store (blobs/xx/<xet hash>), which is not a sha256 of anything we can check.
+                try:
+                    tgt = os.path.basename(os.readlink(p)) if os.path.islink(p) else ""
+                except OSError:
+                    tgt = ""
                 try:
                     size = os.stat(p).st_size
                 except OSError:
@@ -295,7 +393,7 @@ def _hf_local_dir(abs_: str, rel: str, ctx: Context, dev: int) -> Unit | None:
             if not f.endswith(".metadata"):
                 continue
             try:
-                lines = Path(dp, f).read_text().splitlines()
+                lines = _read_text(Path(dp, f)).splitlines()
             except OSError:
                 continue
             if lines and HEX40.match(lines[0].strip()):
@@ -359,7 +457,7 @@ def _venv(abs_: str, rel: str, dev: int) -> Unit | None:
         return None
     pyver = ""
     try:
-        for line in Path(cfg).read_text().splitlines():
+        for line in _read_text(cfg).splitlines():
             k, _, v = line.partition("=")
             if k.strip() in ("version", "version_info"):
                 pyver = v.strip()
@@ -371,7 +469,7 @@ def _venv(abs_: str, rel: str, dev: int) -> Unit | None:
         for di in sp.glob("*.dist-info"):
             name = ver = ""
             try:
-                for line in (di / "METADATA").read_text(errors="replace").splitlines()[:20]:
+                for line in _read_text(di / "METADATA").splitlines()[:20]:
                     if line.startswith("Name: "):
                         name = line[6:].strip()
                     elif line.startswith("Version: "):
@@ -383,7 +481,7 @@ def _venv(abs_: str, rel: str, dev: int) -> Unit | None:
             du = di / "direct_url.json"
             if du.exists():
                 try:
-                    url = json.loads(du.read_text()).get("url", "")
+                    url = json.loads(_read_text(du)).get("url", "")
                 except (OSError, ValueError):
                     url = ""
                 if url.startswith("file://"):
@@ -445,23 +543,45 @@ def _timeshift(abs_: str, rel: str, dev: int) -> Unit | None:
     return u
 
 
+def _hf_shared_store(abs_: str, rel: str, dev: int) -> Unit | None:
+    """huggingface_hub's cache-wide Xet blob store (`<cache>/blobs/<xx>/<hash>`).
+
+    Its bytes belong to the repos whose `blobs/<etag>` symlinks point here; restoring
+    those repos restores this. It is never pruned directly: HF's own delete sweeps
+    entries no repo references any more.
+    """
+    if os.path.basename(abs_) != "blobs" or not os.path.exists(
+            os.path.join(abs_, ".huggingface-shared-blobs")):
+        return None
+    files, total, _ = _du(abs_, dev)
+    u = Unit(rel, "hf-store", RECREATABLE, files, total)
+    u.note = ("huggingface_hub shared Xet blob store: the bytes of the HF repos beside it; "
+              "comes back when they are re-downloaded")
+    return u
+
+
 DIR_CLASSIFIERS: list[Callable[[str, str, int], Unit | None]] = [
+    _hf_shared_store,
     _hf_cache_repo, _ollama, _venv, _cache, _timeshift,
 ]
 
 
 def _classify_dir_unit(abs_: str, rel: str, ctx: Context, dev: int) -> Unit | None:
-    u = _classify_git(abs_, rel, ctx, dev)
-    if u:
-        return u
-    u = _hf_local_dir(abs_, rel, ctx, dev)
-    if u:
-        return u
-    for fn in DIR_CLASSIFIERS:
-        u = fn(abs_, rel, dev)
-        if u:
-            return u
-    return None
+    # Before any classifier runs git: it reads files, and their atime must not count.
+    used = last_used(abs_, dev, follow=os.path.basename(abs_).startswith("models--"))
+    if os.path.lexists(os.path.join(abs_, ".git")):
+        with preserve_atimes(abs_):
+            u = _classify_git(abs_, rel, ctx, dev)
+    else:
+        u = _hf_local_dir(abs_, rel, ctx, dev)
+    if u is None:
+        for fn in DIR_CLASSIFIERS:
+            u = fn(abs_, rel, dev)
+            if u:
+                break
+    if u is not None:
+        u.detail["last_used"] = used
+    return u
 
 
 # --- loose files ----------------------------------------------------------------------
@@ -493,6 +613,7 @@ def _file_kind(path: str, size: int) -> str | None:
 def _classify_file(abs_: str, rel: str, ctx: Context, st: os.stat_result) -> Unit:
     kind = _file_kind(abs_, st.st_size) or "file"
     u = Unit(rel, kind, AT_RISK, 1, st.st_size, listing=[("", st.st_size, "")])
+    u.detail["last_used"] = max(st.st_atime, st.st_mtime)
     parent = os.path.dirname(rel)
     # Only this file's own writes count. A sibling's download is not this file's source.
     src = ctx.source_for(rel)
@@ -574,7 +695,8 @@ def walk(ctx: Context, start: str = "") -> list[Unit]:
     return _apply_claims(units, ctx)
 
 
-SKIP_TOP = {"lost+found", ".Trash-1000", ".provenance"}
+# .provenance-trash: soft-deleted units waiting out their grace period (see prune.py).
+SKIP_TOP = {"lost+found", ".Trash-1000", ".provenance", ".provenance-trash"}
 
 
 def walk_shallow(ctx: Context, start: str) -> list[Unit]:
@@ -610,6 +732,10 @@ def _residual_unit(rel: str, residual: list[tuple[str, int, str]], ctx: Context,
                    subtree: bool = False) -> Unit:
     u = Unit(rel, "data", AT_RISK, len(residual), sum(s for _, s, _ in residual),
              listing=residual)
+    if all(os.path.basename(p) in MARKER_FILES for p, _s, _h in residual):
+        u.risk = EXPENDABLE
+        u.note = "only cache marker files"
+        return u
     if subtree:
         u.detail["subtree"] = True
     src = ctx.source_for(rel)

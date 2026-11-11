@@ -14,6 +14,11 @@ back everything recreatable, and the same recipe lists exactly what was lost.
 
 Nothing is ever written to the watched disk. The recipe exists to survive that disk.
 
+With no second disk, **single-disk mode** turns the same recipe into free space: it deletes
+units nobody has used for a while and that can be rebuilt from their source, after an
+approver has reviewed the list, and brings any of them back on request. See
+[Single-disk mode](#single-disk-mode).
+
 ## How it works
 
 ```
@@ -93,6 +98,62 @@ until someone answers.
 git remote still up, URL still answering, ollama manifest still there. A recreatable unit
 whose source has vanished is listed in `status` with what would be lost.
 
+## Single-disk mode
+
+When there is no second disk, provenance can make room instead: it deletes units that
+are **unused** and **recreatable**, after their recipe is saved, and can bring any of them
+back. Name the directories it may prune as `areas` in `/etc/provenance.toml`. The recipe
+directory can never be inside one, and `/`, `/home`, `/usr`, `/etc`, `/var`, `/boot` and
+`~` are refused as too broad.
+
+**What "unused" means.** It is measured, never guessed:
+
+| Mount | Last use comes from | Prunable after |
+|---|---|---|
+| `relatime` / `strictatime` | newest atime/mtime of the unit's files (atime is accurate to about a day) | `prune_after_days` (30) without use |
+| `noatime` | every `open`/`exec` the daemon sees (fanotify mount mark; works on ntfs3) | the daemon has watched the area **without a gap** for `prune_after_days`, and seen no open in that time |
+
+On a noatime mount there is no history, so nothing there is prunable until the daemon
+has watched it for the full period. A restart (< 1 h gap) or a power-off (the machine
+booted after the last heartbeat) keeps the clock; any other gap, or an overflowed event
+queue, starts it over. provenance's own reads never count: it opens files with
+`O_NOATIME`, skips `.git/`, and puts back the atimes its `git` calls bump.
+
+**The bar for deleting**, checked when the plan is made and again at the moment of
+deletion:
+
+- kind is one of `hf-cache`, `hf-local`, `git`, `venv`, `cache`, `ollama`, or HF-sourced
+  `weights`, and risk is `recreatable` (caches: `expendable`);
+- the source is re-verified online right then: the HF tree has the same sha256s; `git
+  fetch` and HEAD is on a remote branch and the tree is clean; every pinned venv package
+  exists on PyPI; the ollama manifest is still served;
+- no process has anything inside it open, mapped, or as its cwd; it is not a hotline team's
+  repo; nobody claimed it `--keep`; it was not in a plan rejected in the last 30 days.
+
+Never pruned: AT RISK units, plain data, timeshift, URL-only downloads (URLs rot), venvs
+with packages from local paths or private indexes, huggingface_hub's shared blob store.
+
+**Review before every automatic delete.** With `auto_prune = true` the daemon makes at most
+one plan per area per day and sends a concise list (path, kind, size, last use, the proof
+it can be rebuilt) to `prune_approver` (hotline-80). Nothing is deleted until that plan id
+is approved with `provenance prune --approve ID`; `--reject ID` drops it, and unapproved
+plans expire after `plan_ttl_h` (48). The result goes back to the approver and to
+`prune_report_to`. All sessions here run as one uid, so "approved by hotline-80" is a
+recorded label, not a lock: it is a review step, not a security boundary.
+
+**Soft delete.** Pruned units are renamed into `<area>/.provenance-trash/<plan>/` and only
+removed after `trash_grace_h` (24); `provenance restore PATH` moves one straight back.
+After the grace period, `restore` rebuilds it from the recipe as the unit's owner and
+checks it against the stored listing.
+
+**HF caches are the exception.** huggingface_hub >= 2.4 keeps a cache-wide shared blob store
+(`<cache>/blobs/xx/<xet hash>`, refcounted by `.refs` manifests) that each repo's `blobs/`
+symlinks point into. Deleting or renaming a `models--X` directory frees nothing there and
+leaves the store's bookkeeping stale, so provenance asks huggingface_hub what deleting a
+repo frees and lets huggingface_hub delete it (`scan_cache_dir().delete_revisions()`), run
+as the cache owner. Those have no trash period; anything using the model re-downloads it,
+or `provenance restore` does.
+
 ## Install
 
 ```bash
@@ -114,8 +175,12 @@ disks = ["/mnt/hdd"]
 ```
 
 The disk must be its own filesystem mounted exactly there (an fstab line with `nofail`),
-and **ext4, xfs or btrfs**: fanotify filesystem marks need kernel file-handle support,
-which NTFS through ntfs-3g/FUSE lacks.
+with kernel file-handle support for the fanotify write mark: ext4, xfs, btrfs and the
+in-kernel ntfs3 driver work (tested 2026-11-11); FUSE filesystems such as ntfs-3g do not.
+On a filesystem without it, an area still works but has no write attribution.
+
+For single-disk mode, add `areas` instead (or as well) and leave `auto_prune = false` until
+`provenance prune` shows a plan you agree with.
 
 Manual install, for development:
 
@@ -140,6 +205,14 @@ provenance identify                            look up unknown weights via HF re
 provenance scan [PATH] [--dry-run]             scan now (root; --dry-run stores nothing)
 provenance notify [--dry-run]                  ask writers about at-risk data now (root)
 provenance export -o FILE.json.xz              the whole recipe as one file
+provenance prune [AREA] [--all] [--days N]     single-disk mode: what would be deleted (dry run)
+provenance prune --propose                     save that as a plan and send it for review (root)
+provenance prune --approve|--reject PLAN       decide a pending plan (any user; via the spool)
+provenance prune --apply [--yes]               delete now without the review step (root; asks)
+provenance plans [--show PLAN]                 plans and their status
+provenance pruned [--json]                     what was deleted, and where it can come back from
+provenance restore PATH [--dry-run]            bring one back: from trash, else rebuild it
+provenance claim PATH --keep [REASON]          never prune this
 provenance watch                               the daemon (systemd runs this)
 ```
 
@@ -232,6 +305,23 @@ still be rebuilt; `verify-restore` just cannot check it file by file.
 
 **One filesystem per watched path, Linux 5.9+, root.** fanotify needs `CAP_SYS_ADMIN`.
 Subdirectories on other filesystems (bind mounts, nested mounts) are skipped by the walk.
+
+**Single-disk mode trusts the source to stay up.** A pruned unit comes back only if its
+source still serves it: an HF repo can be deleted, a GitHub repo made private, a PyPI
+release yanked. Verification at delete time says the source was there then, not that it
+will be. The weekly `check-sources` covers the live recipe, not pruned units.
+
+**Restores cost bandwidth and time.** Rebuilding a 19 GB model means downloading 19 GB.
+`prune_after_days` and the review step are the only things standing between a model you
+use monthly and a monthly re-download.
+
+**Restored venvs are equivalent, not identical.** The freeze pins versions, not builds or
+hashes, and `uv` may pick a different Python patch release.
+
+**Uses the open-tracker only on noatime mounts.** On relatime mounts last use comes from
+atime alone, so a file that is only `stat`ed or listed (never read) does not count as used.
+A Windows boot that reads files on a shared NTFS partition is not seen by a Linux daemon;
+the power-off rule above treats such a gap as harmless.
 
 **Not a backup tool.** It never copies anything. AT RISK data stays at risk until a person
 or agent backs it up, gives it a source, or calls it expendable.

@@ -28,7 +28,7 @@ if [ ! -x "$REL/.venv/bin/provenance" ]; then
   rm -rf "$REL"
   mkdir -p "$REL"
   "$PY" -m venv "$REL/.venv"
-  "$REL/.venv/bin/pip" install --quiet --disable-pip-version-check "$SRC"
+  "$REL/.venv/bin/pip" install --quiet --disable-pip-version-check "$SRC[hf]"
   "$REL/.venv/bin/provenance" --version >/dev/null
 fi
 ln -sfn "$REL" "$OPT/current.tmp"
