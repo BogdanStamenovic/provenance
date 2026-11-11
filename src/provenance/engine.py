@@ -173,6 +173,8 @@ class Engine:
                 repos.add(src["ref"])
         for (raw,) in q.execute("SELECT source FROM units WHERE source IS NOT NULL"):
             src = json.loads(raw)
+            if src.get("repo_type", "model") != "model":
+                continue  # the lookup uses the models API; datasets answer 401 there
             if src.get("kind") == "hf" and src.get("ref"):
                 repos.add(str(src["ref"]))
         return sorted(r for r in repos if r and "/" in r and not r.startswith("datasets/"))

@@ -230,3 +230,11 @@ def test_coverage_survives_restart_not_long_gap(env: tuple, monkeypatch: pytest.
     st.set_coverage(d.uuid, now - 20 * 86400, now - 2 * 86400)  # box was off, just booted
     dmn._start_coverage(d, now)
     assert st.coverage(d.uuid)[0] == pytest.approx(now - 20 * 86400)
+
+
+def test_cache_recognised_when_area_is_the_cache_dir(tmp_path: Path) -> None:
+    area = tmp_path / ".cache"
+    (area / "uv" / "archive-v0").mkdir(parents=True)
+    (area / "uv" / "archive-v0" / "x").write_bytes(b"x")
+    u = {x.path: x for x in walk(ctx_for(area))}["uv"]
+    assert (u.kind, u.risk) == ("cache", EXPENDABLE)

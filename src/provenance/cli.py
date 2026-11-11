@@ -268,7 +268,9 @@ def _status(cfg: Config, args: argparse.Namespace) -> int:
         at_risk_any |= bool(risky or gone)
         out.append({
             "uuid": d["uuid"], "root": d["root"], "label": d["label"], "size": d["size"],
-            "mounted": bool(mounted and mounted.uuid == d["uuid"]),
+            "mounted": (os.path.isdir(d["root"]) if d["uuid"].startswith("area:")
+                        else bool(mounted and mounted.uuid == d["uuid"])),
+            "area": d["uuid"].startswith("area:"),
             "last_full_scan": d["last_full_scan"],
             "risk": {r: {"units": n, "bytes": b} for r, (n, b) in by.items()},
             "at_risk": [{"path": u.path, "kind": u.kind, "bytes": u.bytes, "note": u.note,
@@ -295,7 +297,8 @@ def _status(cfg: Config, args: argparse.Namespace) -> int:
         when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(float(info["last_full_scan"])))
                 if info["last_full_scan"] else "never")
         print(f"\n{info['root']}  uuid {info['uuid']}  "
-              f"{'mounted' if info['mounted'] else 'NOT MOUNTED'}  last full scan {when}")
+              f"{('area' if info['area'] else 'mounted') if info['mounted'] else 'NOT MOUNTED'}"
+              f"  last full scan {when}")
         for r in RISKS:
             n = info["risk"][r]
             print(f"  {RISK_LABEL[r]:<12} {n['units']:>6} unit(s)  {human(n['bytes']):>10}")

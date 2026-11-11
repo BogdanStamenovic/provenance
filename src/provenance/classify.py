@@ -372,7 +372,8 @@ def _hf_cache_repo(abs_: str, rel: str, dev: int) -> Unit | None:
     hub = os.path.dirname(rel)
     flag = "" if rtype == "models" else f" --repo-type {rtype[:-1]}"
     u = Unit(rel, "hf-cache", RECREATABLE, files, total, listing=listing)
-    u.source = {"kind": "hf", "ref": repo_id, "revision": ",".join(revs) or None}
+    u.source = {"kind": "hf", "ref": repo_id, "revision": ",".join(revs) or None,
+                "repo_type": rtype[:-1]}
     u.rebuild = [f"hf download {repo_id}{flag} --revision {r} --cache-dir {_q(hub)}"
                  for r in revs]
     u.note = f"HF {rtype[:-1]} {repo_id}, {len(revs)} revision(s)"
@@ -510,9 +511,11 @@ def _venv(abs_: str, rel: str, dev: int) -> Unit | None:
 
 def _cache(abs_: str, rel: str, dev: int) -> Unit | None:
     name = os.path.basename(abs_)
-    parts = rel.split("/")
-    is_cache = name in CACHE_NAMES or (len(parts) >= 2 and parts[-2] == ".cache"
-                                       and name in ("uv", "pip", "pnpm", "yarn", "go-build"))
+    # The parent is judged on the absolute path: in an area rooted at ~/.cache, `uv` has
+    # no `.cache` component in its relative path at all.
+    parent = os.path.basename(os.path.dirname(os.path.abspath(abs_)))
+    is_cache = name in CACHE_NAMES or (parent == ".cache" and name in (
+        "uv", "pip", "pnpm", "yarn", "go-build", "pypoetry", "huggingface-xet", "torch_extensions"))
     if not is_cache:
         return None
     files, total, _ = _du(abs_, dev)
